@@ -6,6 +6,9 @@ const fs = require('fs');
 const readline = require('readline');
 const path = require('path');
 const os = require('os');
+const chalk = require('chalk');
+const Table = require('cli-table3');
+const ora = require('ora');
 require('dotenv').config({ path: path.join(os.homedir(), '.mobilism', '.env') });
 
 puppeteer.use(StealthPlugin());
@@ -31,12 +34,135 @@ async function getUserInput(prompt) {
 }
 
 function getCurrentUTCDateTime() {
-    return new Date().toISOString().replace('T', ' ').slice(0, 19);
+    const now = new Date();
+    return now.toISOString()
+        .replace('T', ' ')
+        .replace(/\.\d+Z$/, '');
+}
+
+function parseTopic(topicText) {
+    let title = topicText;
+    let type = '';
+    let author = '';
+    let narrator = '';
+
+    // Extract type from parentheses - get only the content inside last () without the dot
+    const typeMatch = title.match(/\(([^)]+)\)/g);
+    if (typeMatch) {
+        // Get the last parentheses match and remove any dots
+        type = typeMatch[typeMatch.length - 1]
+            .replace(/[()]/g, '')  // Remove parentheses
+            .replace(/\./g, '')    // Remove dots
+            .trim()                // Remove any extra spaces
+            .toUpperCase();        // Convert to uppercase for consistency
+        
+        // Remove the type and any other parentheses content from title
+        title = title.replace(/\s*\([^)]+\)/g, '');
+    }
+
+    // Split by "by" to separate title and author
+    let parts = title.split(' by ');
+    if (parts.length > 1) {
+        title = parts[0].trim();
+        let authorPart = parts[1];
+
+        // Check for narrator
+        if (authorPart.toLowerCase().includes('narrator:')) {
+            let narratorParts = authorPart.split(/narrator:/i);
+            author = narratorParts[0].trim();
+            narrator = narratorParts[1].trim();
+        } else {
+            author = authorPart.trim();
+        }
+    }
+
+    // Remove any remaining parentheses content from title, author, and narrator
+    title = title.replace(/\s*\([^)]+\)/g, '').trim();
+    author = author.replace(/\s*\([^)]+\)/g, '').trim();
+    narrator = narrator.replace(/\s*\([^)]+\)/g, '').trim();
+
+    return {
+        title: title,
+        author: author,
+        narrator: narrator,
+        type: type
+    };
+}
+
+function printHeader() {
+    console.log(`Current Date and Time (UTC - YYYY-MM-DD HH:MM:SS formatted): ${getCurrentUTCDateTime()}`);
+    console.log(`Current User's Login: ${process.env.MOBILISM_USERNAME}\n`);
+}
+
+function printTopics(uniqueTopics) {
+    const table = new Table({
+        head: [
+            chalk.blue('No.'),
+            chalk.blue('Title'),
+            chalk.blue('Author'),
+            chalk.blue('Narrator'),
+            chalk.blue('Type')
+        ],
+        wordWrap: true,
+        wrapOnWordBoundary: true,
+        style: { 'padding-left': 1, 'padding-right': 1 }
+    });
+
+    uniqueTopics.forEach((topic, index) => {
+        const parsed = parseTopic(topic.text);
+        table.push([
+            chalk.yellow(index + 1),
+            chalk.white(parsed.title),
+            chalk.cyan(parsed.author || '-'),
+            chalk.magenta(parsed.narrator || '-'),
+            chalk.green(parsed.type)
+        ]);
+    });
+
+    console.log(table.toString());
+}
+
+function printSelectedTopic(topic, groupedLinks) {
+    const parsed = parseTopic(topic.text);
+    
+    const detailsTable = new Table({
+        style: { 'padding-left': 1, 'padding-right': 1 }
+    });
+
+    detailsTable.push(
+        { [chalk.blue('Title')]: chalk.white(parsed.title) },
+        { [chalk.blue('Author')]: chalk.cyan(parsed.author || '-') },
+        { [chalk.blue('Narrator')]: chalk.magenta(parsed.narrator || '-') },
+        { [chalk.blue('Type')]: chalk.green(parsed.type) },
+        { [chalk.blue('Forum URL')]: chalk.gray(topic.href) }
+    );
+
+    console.log(detailsTable.toString());
+
+    if (Object.keys(groupedLinks).length > 0) {
+        console.log('\nDownload Links:\n');
+
+        Object.entries(groupedLinks).forEach(([host, links]) => {
+            console.log(chalk.yellow(`\n${host}:`));
+            links.forEach(link => {
+                if (link.includes('\n')) {
+                    const [filename, url] = link.split('\n   ');
+                    console.log(chalk.white(`└─ ${chalk.cyan(filename)}`));
+                    console.log(chalk.gray(`   └─ ${url}`));
+                } else {
+                    console.log(chalk.gray(`└─ ${link}`));
+                }
+            });
+        });
+    }
 }
 
 async function loginAndSearch(initialKeyword = null) {
     let browser;
+    const spinner = ora();
+
     try {
+        spinner.start('Launching browser...');
         browser = await puppeteer.launch({
             headless: true,
             args: [
@@ -47,15 +173,16 @@ async function loginAndSearch(initialKeyword = null) {
                 '--disable-gpu'
             ]
         });
+        spinner.succeed();
 
         while (true) {
-            console.log(`Current Date and Time (UTC - YYYY-MM-DD HH:MM:SS formatted): ${getCurrentUTCDateTime()}`);
-            console.log(`Current User's Login: ${process.env.MOBILISM_USERNAME}\n`);
+            console.clear();
+            printHeader();
 
             const page = await browser.newPage();
             await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-            // Login process
+            spinner.start('Logging in to Mobilism...');
             const loginUrl = 'https://forum.mobilism.org/ucp.php?mode=login';
             await page.goto(loginUrl, { waitUntil: 'networkidle0' });
 
@@ -63,6 +190,7 @@ async function loginAndSearch(initialKeyword = null) {
             const password = process.env.MOBILISM_PASSWORD;
 
             if (!username || !password) {
+                spinner.fail('Login failed');
                 throw new Error('Credentials not found. Please run: mobilism-setup');
             }
 
@@ -72,18 +200,20 @@ async function loginAndSearch(initialKeyword = null) {
             await page.click('#load');
 
             await page.waitForNavigation({ waitUntil: 'networkidle0' });
+            spinner.succeed();
 
             const cookies = await page.cookies();
             fs.writeFileSync(path.join(configDir, 'cookies.json'), JSON.stringify(cookies, null, 2));
 
-            // Get search keyword
             const keyword = initialKeyword || await getUserInput('Enter search term: ');
-            initialKeyword = null; // Clear initial keyword for subsequent searches
+            initialKeyword = null;
 
+            spinner.start('Searching...');
             const searchUrl = `https://forum.mobilism.org/search.php?keywords="${encodeURIComponent(keyword)}"&sr=topics&sf=titleonly`;
             await page.goto(searchUrl, { waitUntil: 'networkidle0' });
 
             await new Promise(resolve => setTimeout(resolve, 5000));
+            spinner.succeed();
 
             const topics = await page.evaluate(() => {
                 const links = Array.from(document.querySelectorAll('a[href*="viewtopic.php?f="]'));
@@ -104,10 +234,9 @@ async function loginAndSearch(initialKeyword = null) {
 
             if (topics.length === 0) {
                 console.log('No matching topics found.');
-                console.log('\nWhat would you like to do?');
-                console.log('1. New search');
+                console.log('\n1. New search');
                 console.log('2. Exit');
-                const nextAction = await getUserInput('Enter your choice (1 or 2): ');
+                const nextAction = await getUserInput('\nEnter your choice (1 or 2): ');
 
                 if (nextAction === '2') {
                     console.log('Goodbye!');
@@ -119,22 +248,19 @@ async function loginAndSearch(initialKeyword = null) {
             }
 
             const uniqueTopics = Array.from(
-                new Map(
-                    topics
-                        .filter(topic => topic.text.length > 0)
-                        .map(item => [item.href, item])
-                ).values()
+                new Map(topics.filter(topic => topic.text.length > 0)
+                    .map(item => [item.href, item]))
+                    .values()
             );
 
             let viewingResults = true;
             while (viewingResults) {
-                console.log('\nFound Topics:');
-                uniqueTopics.forEach((topic, index) => {
-                    console.log(`${index + 1}. ${topic.text}`);
-                    console.log(`   URL: ${topic.href}`);
-                });
+                printTopics(uniqueTopics);
 
-                const selection = await getUserInput('\nSelect a topic number to check for download links (or type \'n\' for new search, \'q\' to quit): ');
+                const selection = await getUserInput(
+                    '\nSelect a topic number to check for download links' +
+                    ' (or type \'n\' for new search, \'q\' to quit): '
+                );
 
                 if (selection === 'q') {
                     console.log('Goodbye!');
@@ -152,7 +278,9 @@ async function loginAndSearch(initialKeyword = null) {
                     continue;
                 }
 
+                spinner.start('Fetching download links...');
                 await page.goto(selectedTopic.href, { waitUntil: 'networkidle0' });
+                spinner.succeed();
 
                 const downloadLinks = await page.evaluate(() => {
                     const fileHosts = [
@@ -178,7 +306,6 @@ async function loginAndSearch(initialKeyword = null) {
 
                     const links = new Set();
 
-                    // Method 1: Direct link elements
                     document.querySelectorAll('a[href]').forEach(a => {
                         const href = a.href;
                         const host = getHostFromUrl(href);
@@ -191,42 +318,10 @@ async function loginAndSearch(initialKeyword = null) {
                         }
                     });
 
-                    // Method 2: Look for links in postlink class
-                    document.querySelectorAll('a.postlink').forEach(a => {
-                        const href = a.href;
-                        const host = getHostFromUrl(href);
-                        if (host) {
-                            links.add(JSON.stringify({
-                                host: host,
-                                url: href,
-                                filename: a.textContent.trim() || href.split('/').pop()
-                            }));
-                        }
-                    });
-
-                    // Method 3: Search in HTML content
-                    const postContents = document.querySelectorAll('.content');
-                    postContents.forEach(content => {
-                        const html = content.innerHTML;
-                        fileHosts.forEach(host => {
-                            const regex = new RegExp(`href=["'](https?:\/\/${host.replace('.', '\\.')}[^"']+)["']`, 'gi');
-                            let match;
-                            while ((match = regex.exec(html)) !== null) {
-                                const url = match[1];
-                                links.add(JSON.stringify({
-                                    host: host,
-                                    url: url,
-                                    filename: url.split('/').pop()
-                                }));
-                            }
-                        });
-                    });
-
                     return Array.from(links).map(link => JSON.parse(link));
                 });
 
                 if (downloadLinks.length > 0) {
-                    console.log('\nDownload Links:');
                     const groupedLinks = downloadLinks.reduce((acc, link) => {
                         if (!acc[link.host]) {
                             acc[link.host] = [];
@@ -241,19 +336,16 @@ async function loginAndSearch(initialKeyword = null) {
                         return acc;
                     }, {});
 
-                    for (const [host, links] of Object.entries(groupedLinks)) {
-                        console.log(`\n${host}:`);
-                        links.forEach(link => console.log(link));
-                    }
+                    printSelectedTopic(selectedTopic, groupedLinks);
                 } else {
-                    console.log('No download links found in this topic.');
+                    printSelectedTopic(selectedTopic, {});
+                    console.log('\nNo download links found in this topic.');
                 }
 
-                console.log('\nWhat would you like to do next?');
-                console.log('1. View another search result');
+                console.log('\n1. View another search result');
                 console.log('2. New search');
                 console.log('3. Exit');
-                const nextAction = await getUserInput('Enter your choice (1-3): ');
+                const nextAction = await getUserInput('\nEnter your choice (1-3): ');
 
                 if (nextAction === '3') {
                     console.log('Goodbye!');
@@ -262,17 +354,19 @@ async function loginAndSearch(initialKeyword = null) {
                     viewingResults = false;
                     console.clear();
                 }
-                // If nextAction is '1', the while loop continues
             }
 
             await page.close();
         }
 
     } catch (error) {
-        console.error(`An error occurred:`, error);
+        spinner.fail('An error occurred');
+        console.error('\nError:', error);
     } finally {
         if (browser) {
+            spinner.start('Cleaning up...');
             await browser.close();
+            spinner.succeed();
         }
     }
 }

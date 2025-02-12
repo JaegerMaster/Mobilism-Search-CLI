@@ -1,15 +1,35 @@
 {
   "name": "mobilism-search",
   "version": "1.0.0",
-  "description": "Mobilism forum search tool",
+  "description": "A CLI tool for searching and downloading from Mobilism forums",
+  "main": "mobilism-search.js",
   "bin": {
-    "mobilism-search": "./mobilism-search",
-    "mobilism-setup": "./mobilism-setup"
+    "mobilism-search": "./mobilism-search.js",
+    "mobilism-setup": "./mobilism-setup.js"
   },
+  "scripts": {
+    "start": "node mobilism-search.js",
+    "setup": "node mobilism-setup.js"
+  },
+  "keywords": [
+    "mobilism",
+    "cli",
+    "search",
+    "downloader",
+    "forum"
+  ],
+  "author": "JaegerMaster",
+  "license": "MIT",
   "dependencies": {
-    "puppeteer": "^21.7.0",
+    "chalk": "^4.1.2",
+    "cli-table3": "^0.6.3",
+    "dotenv": "^16.3.1",
+    "ora": "^5.4.1",
+    "puppeteer": "^22.8.2",
     "puppeteer-extra": "^3.3.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.2",
-    "dotenv": "^16.3.1"
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  },
+  "engines": {
+    "node": ">=14.0.0"
   }
 }
