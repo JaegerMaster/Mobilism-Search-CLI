@@ -1,0 +1,242 @@
+#!/usr/bin/env node
+
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const fs = require('fs');
+const readline = require('readline');
+const path = require('path');
+const os = require('os');
+require('dotenv').config({ path: path.join(os.homedir(), '.mobilism', '.env') });
+
+puppeteer.use(StealthPlugin());
+
+// Ensure config directory exists
+const configDir = path.join(os.homedir(), '.mobilism');
+if (!fs.existsSync(configDir)) {
+    fs.mkdirSync(configDir, { recursive: true });
+}
+
+async function getUserInput(prompt) {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
+  });
+
+  return new Promise(resolve => {
+    rl.question(prompt, answer => {
+      rl.close();
+      resolve(answer);
+    });
+  });
+}
+
+function getCurrentUTCDateTime() {
+  return new Date().toISOString().replace('T', ' ').slice(0, 19);
+}
+
+async function loginAndSearch(keyword) {
+  console.log(`Current Date and Time (UTC - YYYY-MM-DD HH:MM:SS formatted): ${getCurrentUTCDateTime()}`);
+  console.log(`Current User's Login: ${process.env.MOBILISM_USERNAME}\n`);
+
+  const browser = await puppeteer.launch({
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas',
+      '--disable-gpu'
+    ]
+  });
+
+  try {
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+
+    // Login process
+    const loginUrl = 'https://forum.mobilism.org/ucp.php?mode=login';
+    await page.goto(loginUrl, { waitUntil: 'networkidle0' });
+
+    const username = process.env.MOBILISM_USERNAME;
+    const password = process.env.MOBILISM_PASSWORD;
+
+    if (!username || !password) {
+      throw new Error('Credentials not found. Please run: mobilism-setup');
+    }
+
+    await page.type('#username', username);
+    await page.type('#password', password);
+    await page.click('label[for="autologin"]');
+    await page.click('#load');
+
+    await page.waitForNavigation({ waitUntil: 'networkidle0' });
+
+    const cookies = await page.cookies();
+    fs.writeFileSync(path.join(configDir, 'cookies.json'), JSON.stringify(cookies, null, 2));
+
+    const searchUrl = `https://forum.mobilism.org/search.php?keywords="${encodeURIComponent(keyword)}"&sr=topics&sf=titleonly`;
+    await page.goto(searchUrl, { waitUntil: 'networkidle0' });
+
+    await new Promise(resolve => setTimeout(resolve, 5000));
+
+    const topics = await page.evaluate(() => {
+      const links = Array.from(document.querySelectorAll('a[href*="viewtopic.php?f="]'));
+      return links
+        .map(a => ({
+          href: a.href.split('&hilit=')[0],
+          text: a.textContent.trim()
+        }))
+        .filter(link => 
+          link.text && 
+          link.text.length > 0 && 
+          !link.text.includes('Jump to post') && 
+          !link.text.includes('The team') &&
+          !link.href.includes('#unread') &&
+          !link.href.includes('#p')
+        );
+    });
+
+    if (topics.length === 0) {
+      console.log('No matching topics found.');
+      return;
+    }
+
+    const uniqueTopics = Array.from(
+      new Map(
+        topics
+          .filter(topic => topic.text.length > 0)
+          .map(item => [item.href, item])
+      ).values()
+    );
+
+    console.log('Found Topics:');
+    uniqueTopics.forEach((topic, index) => {
+      console.log(`${index + 1}. ${topic.text}`);
+      console.log(`   URL: ${topic.href}`);
+    });
+
+    const selection = await getUserInput('\nSelect a topic number to check for download links: ');
+    const selectedTopic = uniqueTopics[parseInt(selection) - 1];
+
+    if (!selectedTopic) {
+      console.log('Invalid selection');
+      return;
+    }
+
+    await page.goto(selectedTopic.href, { waitUntil: 'networkidle0' });
+
+    const downloadLinks = await page.evaluate(() => {
+      const fileHosts = [
+        'uploadrar.com',
+        'sendit.cloud',
+        'rapidgator.net',
+        'rg.to',
+        'filedot.to',
+        'dropgalaxy.vip',
+        'devuploads.com',
+        'novafile.org',
+        'nfile.cc',
+        'uploady.io',
+        'katfile.com',
+        'upfiles.com',
+        'filefactory.com',
+        'uploda.sh'
+      ];
+
+      // Function to determine the host from URL
+      const getHostFromUrl = (url) => {
+        return fileHosts.find(host => url.includes(host));
+      };
+
+      // Get all links, including those with empty titles
+      const links = new Set(); // Use Set to avoid duplicates
+      
+      // Method 1: Direct link elements
+      document.querySelectorAll('a[href]').forEach(a => {
+        const href = a.href;
+        const host = getHostFromUrl(href);
+        if (host) {
+          links.add(JSON.stringify({
+            host: host,
+            url: href,
+            filename: a.textContent.trim() || href.split('/').pop()
+          }));
+        }
+      });
+
+      // Method 2: Look for links in postlink class
+      document.querySelectorAll('a.postlink').forEach(a => {
+        const href = a.href;
+        const host = getHostFromUrl(href);
+        if (host) {
+          links.add(JSON.stringify({
+            host: host,
+            url: href,
+            filename: a.textContent.trim() || href.split('/').pop()
+          }));
+        }
+      });
+
+      // Method 3: Search in HTML content for potential hidden links
+      const postContents = document.querySelectorAll('.content');
+      postContents.forEach(content => {
+        const html = content.innerHTML;
+        fileHosts.forEach(host => {
+          const regex = new RegExp(`href=["'](https?:\/\/${host.replace('.', '\\.')}[^"']+)["']`, 'gi');
+          let match;
+          while ((match = regex.exec(html)) !== null) {
+            const url = match[1];
+            links.add(JSON.stringify({
+              host: host,
+              url: url,
+              filename: url.split('/').pop()
+            }));
+          }
+        });
+      });
+
+      // Convert Set back to array and parse JSON strings
+      return Array.from(links).map(link => JSON.parse(link));
+    });
+
+    if (downloadLinks.length > 0) {
+      console.log('\nDownload Links:');
+      // Group links by host
+      const groupedLinks = downloadLinks.reduce((acc, link) => {
+        if (!acc[link.host]) {
+          acc[link.host] = [];
+        }
+        // Add filename if it's different from the URL
+        const displayUrl = link.filename && link.filename !== link.url 
+          ? `${link.filename}\n   ${link.url}`
+          : link.url;
+        
+        if (!acc[link.host].includes(displayUrl)) {
+          acc[link.host].push(displayUrl);
+        }
+        return acc;
+      }, {});
+
+      // Display grouped links
+      for (const [host, links] of Object.entries(groupedLinks)) {
+        console.log(`\n${host}:`);
+        links.forEach(link => console.log(link));
+      }
+    } else {
+      console.log('No download links found in this topic.');
+    }
+
+  } catch (error) {
+    console.error(`An error occurred:`, error);
+  } finally {
+    await browser.close();
+  }
+}
+
+const keyword = process.argv[2];
+if (!keyword) {
+  console.error('Please provide a keyword to search.');
+  process.exit(1);
+}
+
+loginAndSearch(keyword);
